@@ -1,0 +1,305 @@
+#!/bin/bash
+
+# https://github.com/IamEld3st/encoder-test-suite
+
+VERSION=1.0
+CWD=$(pwd)
+PACKAGES="$CWD/packages"
+WORKSPACE="$CWD/workspace"
+CC=clang
+LDFLAGS="-L${WORKSPACE}/lib -lm"
+CFLAGS="-I${WORKSPACE}/include"
+PKG_CONFIG_PATH="${WORKSPACE}/lib/pkgconfig"
+ADDITIONAL_CONFIGURE_OPTIONS=""
+
+# Speed up the process
+# Env Var NUMJOBS overrides automatic detection
+if [[ -n $NUMJOBS ]]; then
+    MJOBS=$NUMJOBS
+elif [[ -f /proc/cpuinfo ]]; then
+    MJOBS=$(grep -c processor /proc/cpuinfo)
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+	MJOBS=$(sysctl -n machdep.cpu.thread_count)
+	ADDITIONAL_CONFIGURE_OPTIONS="--enable-videotoolbox"
+else
+    MJOBS=4
+fi
+
+make_dir () {
+	if [ ! -d $1 ]; then
+		if ! mkdir $1; then
+			printf "\n Failed to create dir %s" "$1";
+			exit 1
+		fi
+	fi
+}
+
+remove_dir () {
+	if [ -d $1 ]; then
+		rm -r "$1"
+	fi
+}
+
+download () {
+
+	DOWNLOAD_PATH=$PACKAGES;
+
+	if [ ! -z "$3" ]; then
+		mkdir -p $PACKAGES/$3
+		DOWNLOAD_PATH=$PACKAGES/$3
+	fi;
+
+	if [ ! -f "$DOWNLOAD_PATH/$2" ]; then
+
+		echo "Downloading $1"
+		curl -L --silent -o "$DOWNLOAD_PATH/$2" "$1"
+
+		EXITCODE=$?
+		if [ $EXITCODE -ne 0 ]; then
+			echo ""
+			echo "Failed to download $1. Exitcode $EXITCODE. Retrying in 10 seconds";
+			sleep 10
+			curl -L --silent -o "$DOWNLOAD_PATH/$2" "$1"
+		fi
+
+		EXITCODE=$?
+		if [ $EXITCODE -ne 0 ]; then
+			echo ""
+			echo "Failed to download $1. Exitcode $EXITCODE";
+			exit 1
+		fi
+
+		echo "... Done"
+
+		if ! tar -xvf "$DOWNLOAD_PATH/$2" -C "$DOWNLOAD_PATH" 2>/dev/null >/dev/null; then
+			echo "Failed to extract $2";
+			exit 1
+		fi
+
+	fi
+}
+
+execute () {
+	echo "$ $*"
+
+	OUTPUT=$($@ 2>&1)
+
+	if [ $? -ne 0 ]; then
+        echo "$OUTPUT"
+        echo ""
+        echo "Failed to Execute $*" >&2
+        exit 1
+    fi
+}
+
+build () {
+	echo ""
+	echo "building $1"
+	echo "======================="
+
+	if [ -f "$PACKAGES/$1.done" ]; then
+		echo "$1 already built. Remove $PACKAGES/$1.done lockfile to rebuild it."
+		return 1
+	fi
+
+	return 0
+}
+
+command_exists() {
+    if ! [[ -x $(command -v "$1") ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
+
+build_done () {
+	touch "$PACKAGES/$1.done"
+}
+
+echo "ffmpeg-build-script v$VERSION"
+echo "========================="
+echo ""
+
+case "$1" in
+"--cleanup")
+	remove_dir $PACKAGES
+	remove_dir $WORKSPACE
+	echo "Cleanup done."
+	echo ""
+	exit 0
+    ;;
+"--build")
+
+    ;;
+*)
+    echo "Usage: $0"
+    echo "   --build: start building process"
+    echo "   --cleanup: remove all working dirs"
+    echo "   --help: show this help"
+    echo ""
+    exit 0
+    ;;
+esac
+
+echo "Using $MJOBS make jobs simultaneously."
+
+make_dir $PACKAGES
+make_dir $WORKSPACE
+
+export PATH=${WORKSPACE}/bin:$PATH
+
+if ! command_exists "make"; then
+    echo "make not installed.";
+    exit 1
+fi
+
+if ! command_exists "g++"; then
+    echo "g++ not installed.";
+    exit 1
+fi
+
+if ! command_exists "curl"; then
+    echo "curl not installed.";
+    exit 1
+fi
+
+if build "yasm"; then
+	download "http://www.tortall.net/projects/yasm/releases/yasm-1.3.0.tar.gz" "yasm-1.3.0.tar.gz"
+	cd $PACKAGES/yasm-1.3.0 || exit
+	execute ./configure --prefix=${WORKSPACE}
+	execute make -j $MJOBS
+	execute make install
+	build_done "yasm"
+fi
+
+if build "nasm"; then
+	download "https://www.nasm.us/pub/nasm/releasebuilds/2.14.02/nasm-2.14.02.tar.gz" "nasm.tar.gz"
+	cd $PACKAGES/nasm-2.14.02 || exit
+	execute ./configure --prefix=${WORKSPACE} --disable-shared --enable-static
+	execute make -j $MJOBS
+	execute make install
+	build_done "nasm"
+fi
+
+if build "libvpx"; then
+    download "https://github.com/webmproject/libvpx/archive/v1.8.1.tar.gz" "libvpx-1.8.1.tar.gz"
+    cd $PACKAGES/libvpx-1.8.1 || exit
+
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        echo "Applying Darwin patch"
+        sed "s/,--version-script//g" build/make/Makefile > build/make/Makefile.patched
+        sed "s/-Wl,--no-undefined -Wl,-soname/-Wl,-undefined,error -Wl,-install_name/g" build/make/Makefile.patched > build/make/Makefile
+    fi
+
+	execute ./configure --prefix=${WORKSPACE} --disable-unit-tests --disable-shared
+	execute make -j $MJOBS
+	execute make install
+	build_done "libvpx"
+fi
+
+if build "x264"; then
+	download "http://ftp.videolan.org/pub/x264/snapshots/x264-snapshot-20191008-2245-stable.tar.bz2" "last_x264.tar.bz2"
+	cd $PACKAGES/x264-snapshot-* || exit
+
+	if [[ "$OSTYPE" == "linux-gnu" ]]; then
+		execute ./configure --prefix=${WORKSPACE} --enable-static --enable-pic CXXFLAGS="-fPIC"
+    else
+        execute ./configure --prefix=${WORKSPACE} --enable-static --enable-pic
+    fi
+
+    execute make -j $MJOBS
+	execute make install
+	execute make install-lib-static
+	build_done "x264"
+fi
+
+if build "pkg-config"; then
+	download "http://pkgconfig.freedesktop.org/releases/pkg-config-0.29.2.tar.gz" "pkg-config-0.29.2.tar.gz"
+	cd $PACKAGES/pkg-config-0.29.2 || exit
+	execute ./configure --silent --prefix=${WORKSPACE} --with-pc-path=${WORKSPACE}/lib/pkgconfig --with-internal-glib
+	execute make -j $MJOBS
+	execute make install
+	build_done "pkg-config"
+fi
+
+if build "cmake"; then
+	download "https://cmake.org/files/v3.15/cmake-3.15.4.tar.gz" "cmake-3.15.4.tar.gz"
+	cd $PACKAGES/cmake-3.15.4  || exit
+	rm Modules/FindJava.cmake
+	perl -p -i -e "s/get_filename_component.JNIPATH/#get_filename_component(JNIPATH/g" Tests/CMakeLists.txt
+	perl -p -i -e "s/get_filename_component.JNIPATH/#get_filename_component(JNIPATH/g" Tests/CMakeLists.txt
+	execute ./configure --prefix=${WORKSPACE}
+	execute make -j $MJOBS
+	execute make install
+	build_done "cmake"
+fi
+
+if build "x265"; then
+	download "https://bitbucket.org/multicoreware/x265/downloads/x265_3.2.tar.gz" "x265-3.2.tar.gz"
+	cd $PACKAGES/x265_* || exit
+	cd source || exit
+	execute cmake -DCMAKE_INSTALL_PREFIX:PATH=${WORKSPACE} -DENABLE_SHARED:bool=off .
+	execute make -j $MJOBS
+	execute make install
+	sed "s/-lx265/-lx265 -lstdc++/g" "$WORKSPACE/lib/pkgconfig/x265.pc" > "$WORKSPACE/lib/pkgconfig/x265.pc.tmp"
+	mv "$WORKSPACE/lib/pkgconfig/x265.pc.tmp" "$WORKSPACE/lib/pkgconfig/x265.pc"
+	build_done "x265"
+fi
+
+if build "av1"; then
+	download "https://aomedia.googlesource.com/aom/+archive/60a00de69ca79fe5f51dcbf862aaaa8eb50ec344.tar.gz" "av1.tar.gz" "av1"
+	cd $PACKAGES/av1 || exit
+	mkdir -p $PACKAGES/aom_build
+	cd $PACKAGES/aom_build
+	execute cmake -DENABLE_TESTS=0 -DCMAKE_INSTALL_PREFIX:PATH=${WORKSPACE} $PACKAGES/av1
+	execute make -j $MJOBS
+	execute make install
+	build_done "av1"
+fi
+
+if build "avt-av1"; then
+	download "https://github.com/OpenVisualCloud/SVT-AV1/archive/v0.7.0.tar.gz" "svt-av1.tar.gz" "svt-av1"
+	cd $PACKAGES/svt-av1 || exit
+	cd Build/linux || exit
+	execute sh build.sh -j $MJOBS release
+	build_done "svt-av1"
+fi
+
+if build "vvc"; then
+	download "https://vcgit.hhi.fraunhofer.de/jvet/VVCSoftware_VTM/-/archive/VTM-6.2/VVCSoftware_VTM-VTM-6.2.tar.gz" "vvc.tar.gz" "vvc"
+	cd $PACKAGES/vvc || exit
+	mkdir -p $PACKAGES/vvc/build
+	cd build || exit
+	execute cmake -DCMAKE_INSTALL_PREFIX:PATH=${WORKSPACE} -DCMAKE_BUILD_TYPE=Release $PACKAGES/vvc
+	execute make -j $MJOBS
+	execute make install
+	build_done "vvc"
+fi
+
+if build "xvc"; then
+	download "https://github.com/divideon/xvc/archive/master.zip" "xvc.tar.gz" "xvc"
+	cd $PACKAGES/xvc || exit
+	mkdir -p $PACKAGES/xvc/build
+	cd build || exit
+	execute cmake -DCMAKE_INSTALL_PREFIX:PATH=${WORKSPACE} $PACKAGES/xvc
+	execute make -j $MJOBS
+	execute make install
+	build_done "xvc"
+fi
+
+if build "openssl"; then
+	download "https://www.openssl.org/source/openssl-1.1.1d.tar.gz" "openssl-1.1.1d.tar.gz"
+	cd $PACKAGES/openssl-1.1.1d || exit
+	execute ./config --prefix=${WORKSPACE} --openssldir=${WORKSPACE} --with-zlib-include=${WORKSPACE}/include/ --with-zlib-lib=${WORKSPACE}/lib no-shared zlib
+	execute make -j $MJOBS
+	execute make install
+	build_done "openssl"
+fi
+
+echo ""
+echo "Building done."
+echo ""
+
+exit 0
